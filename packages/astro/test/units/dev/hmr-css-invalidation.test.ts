@@ -1,6 +1,52 @@
 import * as assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
+import type { Plugin } from 'vite';
 import hmrReload from '../../../dist/vite-plugin-hmr-reload/index.js';
+
+type MockModule = { id: string | null; file?: string };
+type MockModuleGraphEntry = { id: string };
+
+type HotUpdateContext = {
+	modules: MockModule[];
+	server: MockServer;
+	timestamp: number;
+	file: string;
+};
+
+type HotUpdateHandler = (this: { environment: MockEnvironment }, context: HotUpdateContext) => unknown;
+
+type MockEnvironment = {
+	name: string;
+	moduleGraph: {
+		idToModuleMap: Map<string, MockModuleGraphEntry>;
+		getModuleById: (id: string) => MockModuleGraphEntry | null;
+		invalidateModule: (
+			mod: MockModuleGraphEntry,
+			seen?: Set<unknown>,
+			timestamp?: number,
+			isHmr?: boolean,
+		) => void;
+	};
+	runner?: {
+		evaluatedModules: {
+			getModuleById: (id: string) => MockModuleGraphEntry | null;
+			invalidateModule: (mod: MockModuleGraphEntry) => void;
+		};
+	};
+};
+
+type MockServer = {
+	environments: {
+		client: {
+			moduleGraph: {
+				getModuleById: (id: string) => object | null;
+			};
+		};
+	};
+	ws: {
+		send: () => void;
+	};
+};
 
 /**
  * Tests for CSS HMR invalidation of SSR dev-css virtual modules.
@@ -9,44 +55,59 @@ import hmrReload from '../../../dist/vite-plugin-hmr-reload/index.js';
  * invalidate the per-route virtual:astro:dev-css:* modules in the SSR
  * environment so the next SSR render picks up fresh CSS content.
  * Without this, the server-rendered inline <style> tags serve stale CSS.
- *
- * Note: Runner evaluation cache invalidation (via isRunnableDevEnvironment)
- * requires a real Vite RunnableDevEnvironment instance and cannot be unit
- * tested with mocks. That path is verified through manual integration testing.
  */
 describe('astro:hmr-reload CSS invalidation', () => {
-	/**
-	 * Creates a mock environment and context for testing the hotUpdate handler.
-	 * The environment mock is not a real RunnableDevEnvironment, so
-	 * isRunnableDevEnvironment() will return false. This means runner cache
-	 * invalidation won't be tested here, but module graph invalidation will.
-	 */
+	function getHotUpdateHandler(plugin: Plugin): HotUpdateHandler {
+		const hotUpdate = plugin.hotUpdate;
+
+		assert.ok(hotUpdate && typeof hotUpdate === 'object' && 'handler' in hotUpdate);
+
+		return hotUpdate.handler as HotUpdateHandler;
+	}
+
 	function createMockContext(options: {
-		modules: Array<{ id: string | null; file?: string }>;
-		moduleGraphEntries?: Array<[string, { id: string }]>;
+		moduleGraphEntries?: Array<[string, MockModuleGraphEntry]>;
+		runnable?: boolean;
 	}) {
 		const invalidatedModuleGraphIds: string[] = [];
+		const invalidatedRunnerIds: string[] = [];
 
-		const moduleGraphEntries = new Map<string, { id: string }>(
+		const moduleGraphEntries = new Map<string, MockModuleGraphEntry>(
 			options.moduleGraphEntries ?? [],
 		);
 
-		const environment = {
+		const runnerEntries = new Map<string, MockModuleGraphEntry>(
+			options.moduleGraphEntries ?? [],
+		);
+
+		const environment: MockEnvironment = {
 			name: 'ssr',
 			moduleGraph: {
 				idToModuleMap: moduleGraphEntries,
-				getModuleById: (id: string) => moduleGraphEntries.get(id) ?? null,
-				invalidateModule: (mod: { id: string }, _seen?: Set<unknown>, _ts?: number, _isHmr?: boolean) => {
+				getModuleById: (id) => moduleGraphEntries.get(id) ?? null,
+				invalidateModule: (mod) => {
 					invalidatedModuleGraphIds.push(mod.id);
 				},
 			},
+			...(options.runnable
+				? {
+						runner: {
+							evaluatedModules: {
+								getModuleById: (id: string) => runnerEntries.get(id) ?? null,
+								invalidateModule: (mod: MockModuleGraphEntry) => {
+									invalidatedRunnerIds.push(mod.id);
+								},
+							},
+						},
+					}
+				: {}),
 		};
 
-		const server = {
+		const server: MockServer = {
 			environments: {
 				client: {
 					moduleGraph: {
-						getModuleById: (_id: string) => null as object | null,
+						getModuleById: () => null,
 					},
 				},
 			},
@@ -57,7 +118,33 @@ describe('astro:hmr-reload CSS invalidation', () => {
 			environment,
 			server,
 			invalidatedModuleGraphIds,
+			invalidatedRunnerIds,
 		};
+	}
+
+	function runHotUpdate({
+		environment,
+		server,
+		modules,
+		file,
+	}: {
+		environment: MockEnvironment;
+		server: MockServer;
+		modules: MockModule[];
+		file: string;
+	}) {
+		const plugin = hmrReload();
+		const handler = getHotUpdateHandler(plugin);
+
+		return handler.call(
+			{ environment },
+			{
+				modules,
+				server,
+				timestamp: Date.now(),
+				file,
+			},
+		);
 	}
 
 	it('invalidates dev-css virtual modules in module graph when a CSS file changes', () => {
@@ -65,7 +152,6 @@ describe('astro:hmr-reload CSS invalidation', () => {
 		const devCssId2 = '\0virtual:astro:dev-css:src/pages/posts/[id]@_@astro';
 
 		const { environment, server, invalidatedModuleGraphIds } = createMockContext({
-			modules: [{ id: '/path/to/global.css', file: '/path/to/global.css' }],
 			moduleGraphEntries: [
 				[devCssId1, { id: devCssId1 }],
 				[devCssId2, { id: devCssId2 }],
@@ -73,143 +159,99 @@ describe('astro:hmr-reload CSS invalidation', () => {
 			],
 		});
 
-		const plugin = hmrReload();
-		const hotUpdate = plugin.hotUpdate as { order: string; handler: Function };
+		const result = runHotUpdate({
+			environment,
+			server,
+			modules: [{ id: '/path/to/global.css', file: '/path/to/global.css' }],
+			file: '/path/to/global.css',
+		});
 
-		const result = hotUpdate.handler.call(
-			{ environment },
-			{
-				modules: [{ id: '/path/to/global.css', file: '/path/to/global.css' }],
-				server,
-				timestamp: Date.now(),
-				file: '/path/to/global.css',
-			},
-		);
-
-		// Should return empty array (handled, no full reload)
 		assert.deepEqual(result, []);
-
-		// Both dev-css virtual modules should be invalidated in the module graph
-		assert.ok(
-			invalidatedModuleGraphIds.includes(devCssId1),
-			'dev-css module for index should be invalidated in module graph',
-		);
-		assert.ok(
-			invalidatedModuleGraphIds.includes(devCssId2),
-			'dev-css module for dynamic route should be invalidated in module graph',
-		);
-
-		// Non-dev-css modules should NOT be invalidated
-		assert.ok(
-			!invalidatedModuleGraphIds.includes('some-other-module'),
-			'non-dev-css modules should not be invalidated',
-		);
+		assert.deepEqual(invalidatedModuleGraphIds, [devCssId1, devCssId2]);
 	});
 
 	it('invalidates dev-css modules for SCSS file changes', () => {
 		const devCssId = '\0virtual:astro:dev-css:src/pages/index@_@astro';
 
 		const { environment, server, invalidatedModuleGraphIds } = createMockContext({
-			modules: [{ id: '/path/to/styles.scss', file: '/path/to/styles.scss' }],
-			moduleGraphEntries: [
-				[devCssId, { id: devCssId }],
-			],
+			moduleGraphEntries: [[devCssId, { id: devCssId }]],
 		});
 
-		const plugin = hmrReload();
-		const hotUpdate = plugin.hotUpdate as { order: string; handler: Function };
-
-		const result = hotUpdate.handler.call(
-			{ environment },
-			{
-				modules: [{ id: '/path/to/styles.scss', file: '/path/to/styles.scss' }],
-				server,
-				timestamp: Date.now(),
-				file: '/path/to/styles.scss',
-			},
-		);
+		const result = runHotUpdate({
+			environment,
+			server,
+			modules: [{ id: '/path/to/styles.scss', file: '/path/to/styles.scss' }],
+			file: '/path/to/styles.scss',
+		});
 
 		assert.deepEqual(result, []);
-		assert.ok(
-			invalidatedModuleGraphIds.includes(devCssId),
-			'dev-css module should be invalidated for SCSS changes',
-		);
+		assert.deepEqual(invalidatedModuleGraphIds, [devCssId]);
+	});
+
+	it('invalidates dev-css modules in the runner evaluation cache when runnable', () => {
+		const devCssId = '\0virtual:astro:dev-css:src/pages/index@_@astro';
+
+		const { environment, server, invalidatedRunnerIds } = createMockContext({
+			runnable: true,
+			moduleGraphEntries: [[devCssId, { id: devCssId }]],
+		});
+
+		const result = runHotUpdate({
+			environment,
+			server,
+			modules: [{ id: '/path/to/styles.css', file: '/path/to/styles.css' }],
+			file: '/path/to/styles.css',
+		});
+
+		assert.deepEqual(result, []);
+		assert.deepEqual(invalidatedRunnerIds, [devCssId]);
 	});
 
 	it('does not invalidate dev-css modules when no style modules are present', () => {
 		const devCssId = '\0virtual:astro:dev-css:src/pages/index@_@astro';
 
 		const { environment, server, invalidatedModuleGraphIds } = createMockContext({
-			modules: [{ id: '/path/to/component.astro', file: '/path/to/component.astro' }],
-			moduleGraphEntries: [
-				[devCssId, { id: devCssId }],
-			],
+			moduleGraphEntries: [[devCssId, { id: devCssId }]],
 		});
 
-		// The .astro file exists in the client module graph too
-		server.environments.client.moduleGraph.getModuleById = (id: string) =>
+		server.environments.client.moduleGraph.getModuleById = (id) =>
 			id === '/path/to/component.astro' ? { id } : null;
 
-		const plugin = hmrReload();
-		const hotUpdate = plugin.hotUpdate as { order: string; handler: Function };
+		const result = runHotUpdate({
+			environment,
+			server,
+			modules: [{ id: '/path/to/component.astro', file: '/path/to/component.astro' }],
+			file: '/path/to/component.astro',
+		});
 
-		const result = hotUpdate.handler.call(
-			{ environment },
-			{
-				modules: [{ id: '/path/to/component.astro', file: '/path/to/component.astro' }],
-				server,
-				timestamp: Date.now(),
-				file: '/path/to/component.astro',
-			},
-		);
-
-		// For client-visible module changes, the handler returns undefined
 		assert.equal(result, undefined);
-
-		// The dev-css module should NOT be invalidated (CSS invalidation is for style-only changes)
 		assert.equal(invalidatedModuleGraphIds.length, 0);
 	});
 
 	it('returns empty array for CSS changes to prevent full page reload', () => {
-		const { environment, server } = createMockContext({
+		const { environment, server } = createMockContext({});
+
+		const result = runHotUpdate({
+			environment,
+			server,
 			modules: [{ id: '/path/to/styles.css', file: '/path/to/styles.css' }],
+			file: '/path/to/styles.css',
 		});
 
-		const plugin = hmrReload();
-		const hotUpdate = plugin.hotUpdate as { order: string; handler: Function };
-
-		const result = hotUpdate.handler.call(
-			{ environment },
-			{
-				modules: [{ id: '/path/to/styles.css', file: '/path/to/styles.css' }],
-				server,
-				timestamp: Date.now(),
-				file: '/path/to/styles.css',
-			},
-		);
-
-		// Must return [] to prevent Vite's default SSR HMR propagation
 		assert.deepEqual(result, []);
 	});
 
 	it('handles empty dev-css module map gracefully', () => {
 		const { environment, server, invalidatedModuleGraphIds } = createMockContext({
-			modules: [{ id: '/path/to/styles.css', file: '/path/to/styles.css' }],
 			moduleGraphEntries: [],
 		});
 
-		const plugin = hmrReload();
-		const hotUpdate = plugin.hotUpdate as { order: string; handler: Function };
-
-		const result = hotUpdate.handler.call(
-			{ environment },
-			{
-				modules: [{ id: '/path/to/styles.css', file: '/path/to/styles.css' }],
-				server,
-				timestamp: Date.now(),
-				file: '/path/to/styles.css',
-			},
-		);
+		const result = runHotUpdate({
+			environment,
+			server,
+			modules: [{ id: '/path/to/styles.css', file: '/path/to/styles.css' }],
+			file: '/path/to/styles.css',
+		});
 
 		assert.deepEqual(result, []);
 		assert.equal(invalidatedModuleGraphIds.length, 0);
