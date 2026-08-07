@@ -621,16 +621,11 @@ async function render({
 					scripts = '';
 				if (Array.isArray(collectedStyles)) {
 					styles = collectedStyles
-						.map((style) => {
-							const content = typeof style === 'string' ? style : style.content;
-							return renderUniqueStylesheet(
-								result,
-								{
-									type: 'inline',
-									content,
-								},
-								typeof style === 'string' ? undefined : { 'data-vite-dev-id': style.id },
-							);
+						.map((style: any) => {
+							return renderUniqueStylesheet(result, {
+								type: 'inline',
+								content: style,
+							});
 						})
 						.join('');
 				}
@@ -726,7 +721,7 @@ export function createReference() {
 type PropagatedAssetsModule = {
 	__astroPropagation: true;
 	getMod: () => Promise<any>;
-	collectedStyles: Array<string | { id: string; content: string }>;
+	collectedStyles: string[];
 	collectedLinks: string[];
 	collectedScripts: string[];
 };
